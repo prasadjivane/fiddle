@@ -20,10 +20,11 @@ of base configuration, and these APIs allow such overrides to take place
 imperatively.
 """
 
-from typing import Any, Callable, Iterator, Optional, Set, Type, Union
+from typing import Any, Callable, List, Iterator, Optional, Set, Type, Union
 
 from fiddle import config
 from fiddle import tagging
+from fiddle.experimental import daglish
 import tree
 
 # Maybe DRY up with type declaration in autobuilders.py?
@@ -43,7 +44,6 @@ class Selection:
   """
   cfg: config.Buildable
   fn_or_cls: Optional[FnOrClass]
-  tag: Optional[tagging.TagType]
   match_subclasses: bool
   buildable_type: Type[config.Buildable]
 
@@ -58,7 +58,6 @@ class Selection:
   ):
     super().__setattr__("cfg", cfg)
     super().__setattr__("fn_or_cls", fn_or_cls)
-    super().__setattr__("tag", tag)
     super().__setattr__("match_subclasses", match_subclasses)
 
     if buildable_type is None:
@@ -75,15 +74,6 @@ class Selection:
 
     # Implementation note: To allow for future expansion of this class, checks
     # here should be expressed as `if not my_matcher.match(x): return False`.
-
-    # For tags, check that the tag is present, and then
-    # refer to underlying configuration.
-    if self.tag is not None:
-      if not isinstance(node, tagging.TaggedValueCls):
-        return False
-      if not any(issubclass(tag, self.tag) for tag in node.tags):
-        return False
-      node = node.value
 
     if self.buildable_type is not None:
       if not isinstance(node, self.buildable_type):
@@ -159,4 +149,83 @@ class Selection:
       yield getattr(matching, name)
 
 
-select = Selection  # pylint: disable=invalid-name
+class TagSelection:
+  """Represents a selection of fields tagged by a given tag."""
+
+  cfg: config.Buildable
+  tag: tagging.TagType
+
+  def __init__(self, cfg: config.Buildable, tag: tagging.TagType):
+    super().__setattr__("cfg", cfg)
+    super().__setattr__("tag", tag)
+
+  def set(self, value: Any) -> None:
+    """Sets the value for the tag.
+
+    Args:
+      value: Value to set.
+    """
+
+    def traverse_fn(unused_path, old_value):
+      if isinstance(old_value, config.Buildable):
+        for name, tags in old_value.__argument_tags__.items():
+          if any(issubclass(tag, self.tag) for tag in tags):
+            setattr(old_value, name, value)
+      return (yield)
+
+    daglish.traverse_with_path(traverse_fn, self.cfg)
+
+  def get(self) -> List[Any]:
+    """Yields all values for the selected tag."""
+    all_values = []
+
+    def traverse_fn(unused_all_paths, old_value):
+      if isinstance(old_value, config.Buildable):
+        for name, tags in old_value.__argument_tags__.items():
+          if any(issubclass(tag, self.tag) for tag in tags):
+            all_values.append(getattr(old_value, name))
+      return (yield)
+
+    daglish.memoized_traverse(traverse_fn, self.cfg)
+    return all_values
+
+
+def select(
+    cfg: config.Buildable,
+    fn_or_cls: Optional[FnOrClass] = None,
+    *,
+    tag: Optional[tagging.TagType] = None,
+    match_subclasses: bool = True,
+    buildable_type: Optional[Type[config.Buildable]] = None,
+) -> Union[Selection, TagSelection]:
+  """Selects sub-buildables or fields within a configuration DAG.
+
+  Example configuring attention classes:
+
+  select(my_config, MyDenseAttention).set(num_heads=12, head_dim=512)
+
+  Example configuring all activation dtypes:
+
+  select(my_config, tag=DType).set(value=jnp.float32)
+
+  Args:
+    cfg: Configuraiton to traverse.
+    fn_or_cls: Select by a given function or class that is being configured.
+    tag: If set, selects all attributes tagged by `tag`. This will return a
+      TagSelection instead of a Selection, which has a slightly different API.
+    match_subclasses: If fn_or_cls is provided and a class, then also match
+      subclasses of `fn_or_cls`.
+    buildable_type: Restrict the selection to a particular buildable type. Not
+      valid for tag selections.
+
+  Returns:
+    Either a Selection or TagSelection object.
+  """
+  if tag is not None:
+    return TagSelection(cfg, tag)
+  else:
+    return Selection(
+        cfg,
+        fn_or_cls,
+        match_subclasses=match_subclasses,
+        buildable_type=buildable_type)
